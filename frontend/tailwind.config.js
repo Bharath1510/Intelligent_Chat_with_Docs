@@ -5,13 +5,21 @@ export default {
   theme: {
     extend: {
       colors: {
+        // Full indigo scale. 200/300/400/800/950 were used throughout the app but
+        // never defined, so those utilities generated no CSS and the elements using
+        // them (citation links, badges) fell back to inherited colours.
         brand: {
           50: '#eef2ff',
           100: '#e0e7ff',
+          200: '#c7d2fe',
+          300: '#a5b4fc',
+          400: '#818cf8',
           500: '#6366f1',
           600: '#4f46e5',
           700: '#4338ca',
+          800: '#3730a3',
           900: '#312e81',
+          950: '#1e1b4b',
         },
         surface: {
           light: '#f8fafc',

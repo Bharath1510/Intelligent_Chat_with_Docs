@@ -22,7 +22,32 @@ export const DashboardPage: React.FC = () => {
       .catch(() => setHealth(null));
   }, [fetchDocuments]);
 
-  const totalIndexed = documents.filter((d) => d.status === 'indexed').length;
+  const countOf = (...statuses: string[]) =>
+    documents.filter((d) => statuses.includes(d.status)).length;
+
+  const totalIndexed = countOf('indexed');
+  const inProgress = countOf('uploaded', 'processing', 'indexing');
+  const needsReview = countOf('ocr_ready');
+  const failed = countOf('failed');
+
+  // Describe what the documents are actually doing rather than asserting a fixed state.
+  const documentSummary = (): string => {
+    if (documents.length === 0) return 'Upload a scan to get started';
+    const parts = [];
+    if (inProgress) parts.push(`${inProgress} processing`);
+    if (needsReview) parts.push(`${needsReview} awaiting review`);
+    if (failed) parts.push(`${failed} failed`);
+    if (parts.length === 0) return 'All indexed and searchable';
+    return parts.join(' · ');
+  };
+
+  const summaryTone = failed
+    ? 'text-rose-500'
+    : inProgress || needsReview
+    ? 'text-amber-500'
+    : documents.length
+    ? 'text-emerald-500'
+    : 'text-slate-400';
   const totalStorageMB = (documents.reduce((acc, d) => acc + d.file_size, 0) / (1024 * 1024)).toFixed(2);
 
   return (
@@ -61,7 +86,7 @@ export const DashboardPage: React.FC = () => {
             </div>
           </div>
           <p className="text-2xl font-bold mt-2 text-slate-900 dark:text-white">{documents.length}</p>
-          <span className="text-xs text-emerald-500 font-medium">Ready for indexing</span>
+          <span className={`text-xs font-medium ${summaryTone}`}>{documentSummary()}</span>
         </div>
 
         <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-soft-sm">
@@ -72,7 +97,9 @@ export const DashboardPage: React.FC = () => {
             </div>
           </div>
           <p className="text-2xl font-bold mt-2 text-slate-900 dark:text-white">{totalIndexed}</p>
-          <span className="text-xs text-slate-400">Vector store chunks active</span>
+          <span className="text-xs text-slate-400">
+            {totalIndexed > 0 ? 'Searchable in RAG chat' : 'Index a document to start chatting'}
+          </span>
         </div>
 
         <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-soft-sm">
