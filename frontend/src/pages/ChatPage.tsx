@@ -33,9 +33,13 @@ export const ChatPage: React.FC = () => {
   const [previewCitation, setPreviewCitation] = useState<Citation | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  // StrictMode runs effects twice in dev; without this the app creates two empty sessions.
+  const bootstrappedRef = useRef(false);
 
   // Load chat sessions and available documents
   useEffect(() => {
+    if (bootstrappedRef.current) return;
+    bootstrappedRef.current = true;
     fetchSessions();
     fetchDocuments();
   }, [fetchDocuments]);
@@ -74,9 +78,9 @@ export const ChatPage: React.FC = () => {
 
   const createNewSession = async () => {
     try {
+      // Title omitted on purpose: the backend renames the session after the first question.
       const res = await api.post('/chat/sessions', {
-        title: 'New RAG Session',
-        document_ids: selectedDocFilter,
+        document_ids: selectedDocFilter.length > 0 ? selectedDocFilter : null,
       });
       setSessions((prev) => [res.data, ...prev]);
       setActiveSessionId(res.data.id);
@@ -138,13 +142,23 @@ export const ChatPage: React.FC = () => {
       },
       () => {
         setIsStreaming(false);
+        fetchSessions(); // picks up the server-side auto-title for this session
       },
       (err: any) => {
         console.error('Streaming error', err);
         setIsStreaming(false);
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === assistantMsgId && !msg.text
+              ? { ...msg, text: `⚠️ ${err?.message || 'The answer stream failed. Please try again.'}` }
+              : msg
+          )
+        );
       }
     );
   };
+
+  const streamingMsgId = isStreaming ? messages[messages.length - 1]?.id : null;
 
   return (
     <div className="h-[calc(100vh-4rem)] flex overflow-hidden bg-slate-950">
@@ -220,6 +234,12 @@ export const ChatPage: React.FC = () => {
               <p className="text-xs text-slate-400 max-w-md mt-2">
                 Ask questions about your uploaded PDFs and scans. Answers are generated strictly from indexed chunks with exact citations.
               </p>
+              {indexedDocuments.length === 0 && (
+                <div className="mt-4 px-4 py-3 rounded-xl bg-amber-950/40 border border-amber-800/50 text-xs text-amber-300 max-w-md">
+                  No documents are indexed yet. Upload a file, review the extracted text,
+                  then choose <strong>Confirm &amp; Index for Chat</strong> before asking questions.
+                </div>
+              )}
               <div className="mt-6 flex flex-wrap gap-2 justify-center">
                 <button
                   onClick={() => setInputQuery('Summarize the key findings from the uploaded document.')}
@@ -261,7 +281,9 @@ export const ChatPage: React.FC = () => {
                         : 'bg-slate-900 text-slate-100 border border-slate-800 rounded-tl-none'
                     }`}
                   >
-                    <p className="whitespace-pre-wrap">{msg.text || (isStreaming ? 'Thinking...' : '')}</p>
+                    <p className="whitespace-pre-wrap">
+                      {msg.text || (msg.id === streamingMsgId ? 'Thinking…' : '')}
+                    </p>
                   </div>
 
                   {/* Citations list */}
@@ -300,7 +322,12 @@ export const ChatPage: React.FC = () => {
               value={inputQuery}
               onChange={(e) => setInputQuery(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-              placeholder="Ask a question about your indexed documents..."
+              disabled={isStreaming}
+              placeholder={
+                indexedDocuments.length === 0
+                  ? 'Index a document first to start asking questions…'
+                  : 'Ask a question about your indexed documents…'
+              }
               className="flex-1 bg-transparent px-3 py-2 text-sm text-white focus:outline-none"
             />
 

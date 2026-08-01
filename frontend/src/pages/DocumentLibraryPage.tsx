@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
 import { api } from '../services/api';
+import { StatusBadge } from '../components/StatusBadge';
 import { FileText, Search, Trash2, MessageSquare, Edit3, Filter, Plus } from 'lucide-react';
 
 export const DocumentLibraryPage: React.FC = () => {
@@ -68,9 +69,10 @@ export const DocumentLibraryPage: React.FC = () => {
             className="px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl text-xs text-slate-900 dark:text-slate-100 focus:outline-none"
           >
             <option value="all">All Statuses</option>
-            <option value="uploaded">Uploaded</option>
-            <option value="processing">Processing</option>
-            <option value="ocr_ready">OCR Ready</option>
+            <option value="uploaded">Queued</option>
+            <option value="processing">Running OCR</option>
+            <option value="ocr_ready">Needs review</option>
+            <option value="indexing">Indexing</option>
             <option value="indexed">Indexed</option>
             <option value="failed">Failed</option>
           </select>
@@ -99,19 +101,7 @@ export const DocumentLibraryPage: React.FC = () => {
                     <FileText className="w-6 h-6" />
                   </div>
 
-                  <span
-                    className={`text-xs px-2.5 py-0.5 rounded-full font-semibold border ${
-                      doc.status === 'indexed'
-                        ? 'bg-emerald-50 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
-                        : doc.status === 'ocr_ready'
-                        ? 'bg-blue-50 dark:bg-blue-950 text-blue-600 dark:text-blue-300 border-blue-200 dark:border-blue-800'
-                        : doc.status === 'failed'
-                        ? 'bg-rose-50 dark:bg-rose-950 text-rose-600 dark:text-rose-300 border-rose-200 dark:border-rose-800'
-                        : 'bg-amber-50 dark:bg-amber-950 text-amber-600 dark:text-amber-300 border-amber-200 dark:border-amber-800'
-                    }`}
-                  >
-                    {doc.status.replace('_', ' ')}
-                  </span>
+                  <StatusBadge status={doc.status} title={doc.error_message} />
                 </div>
 
                 <h3 className="font-bold text-sm text-slate-900 dark:text-slate-100 truncate" title={doc.filename}>
@@ -120,6 +110,9 @@ export const DocumentLibraryPage: React.FC = () => {
                 <p className="text-xs text-slate-400 mt-1">
                   {(doc.file_size / (1024 * 1024)).toFixed(2)} MB • {doc.total_pages} Page(s)
                 </p>
+                {doc.status === 'failed' && doc.error_message && (
+                  <p className="text-xs text-rose-500 mt-2 line-clamp-2">{doc.error_message}</p>
+                )}
               </div>
 
               <div className="mt-4 pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">

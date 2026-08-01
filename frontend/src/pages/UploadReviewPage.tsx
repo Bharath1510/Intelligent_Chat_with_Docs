@@ -2,13 +2,24 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { api } from '../services/api';
 import { useApp } from '../context/AppContext';
-import { Upload, FileText, CheckCircle, RefreshCw, Edit3, Eye, Loader2, AlertCircle } from 'lucide-react';
+import { DocProcessingStatus } from '../types';
+import {
+  Upload, FileText, CheckCircle, RefreshCw, Edit3, Eye, Loader2, AlertCircle, RotateCcw,
+} from 'lucide-react';
 
-type DocProcessingStatus = 'uploaded' | 'processing' | 'ocr_ready' | 'indexed' | 'failed';
+const POLL_MS = 2000;
+// Statuses the backend is still working on — keep polling while we see them.
+const ACTIVE_STATUSES: DocProcessingStatus[] = ['uploaded', 'processing', 'indexing'];
+
+const STAGE_LABEL: Record<string, string> = {
+  uploaded: 'Queued for OCR…',
+  processing: 'Running PaddleOCR…',
+  indexing: 'Chunking & embedding into the vector store…',
+};
 
 export const UploadReviewPage: React.FC = () => {
   const [searchParams] = useSearchParams();
-  const selectedDocId = searchParams.get('doc');
+  const docId = searchParams.get('doc');
   const navigate = useNavigate();
 
   const {
@@ -24,109 +35,112 @@ export const UploadReviewPage: React.FC = () => {
   } = useApp();
 
   const [loadingReview, setLoadingReview] = useState(false);
-  const [confirming, setConfirming] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [docStatus, setDocStatus] = useState<DocProcessingStatus | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [chunkCount, setChunkCount] = useState(0);
   const [mobileTab, setMobileTab] = useState<'original' | 'text'>('text');
+  // Bumped to restart the poller after confirm/retry queues new backend work.
+  const [pollToken, setPollToken] = useState(0);
 
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // Load review data when doc ID changes (from URL or after upload)
+  // Read inside polling callbacks without re-subscribing the effect on every keystroke.
+  const activeDocRef = useRef(activeReviewDocId);
   useEffect(() => {
-    if (selectedDocId && selectedDocId !== activeReviewDocId) {
-      setActiveReviewDocId(selectedDocId);
-      startPollingStatus(selectedDocId);
-    }
-    return () => stopPolling();
-  }, [selectedDocId]);
+    activeDocRef.current = activeReviewDocId;
+  }, [activeReviewDocId]);
 
-  // Restore review state if coming back to the same doc
+  const loadReviewData = useCallback(
+    async (id: string) => {
+      setLoadingReview(true);
+      try {
+        const { data } = await api.get(`/documents/${id}/review`);
+        setReviewData(data);
+        setDocStatus(data.status);
+        setStatusError(data.error_message ?? null);
+        // Only seed the editor when this is a different document, so edits survive navigation.
+        if (activeDocRef.current !== id) {
+          setEditedText(data.ocr_edited_text || data.ocr_raw_text || '');
+          setActiveReviewDocId(id);
+          activeDocRef.current = id;
+        }
+      } catch (err) {
+        console.error('Failed to fetch review data', err);
+        setStatusError('Could not load the extracted text for this document.');
+      } finally {
+        setLoadingReview(false);
+      }
+    },
+    [setReviewData, setEditedText, setActiveReviewDocId]
+  );
+
+  // Single source of truth for status. Runs for EVERY doc id — including the one
+  // we just uploaded — and follows it through OCR and indexing to a terminal state.
   useEffect(() => {
-    if (selectedDocId && selectedDocId === activeReviewDocId && reviewData) {
-      setDocStatus(reviewData.status as DocProcessingStatus);
+    if (!docId) {
+      setDocStatus(null);
+      setStatusError(null);
+      return;
     }
-  }, [selectedDocId, activeReviewDocId, reviewData]);
 
-  const stopPolling = () => {
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
-  };
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
 
-  const startPollingStatus = (docId: string) => {
-    stopPolling();
-    // Immediately check status
-    checkStatusAndLoad(docId);
-    // Then poll every 2s
-    pollingRef.current = setInterval(() => checkStatusAndLoad(docId), 2000);
-  };
+    const tick = async () => {
+      try {
+        const { data } = await api.get(`/documents/${docId}/status`);
+        if (cancelled) return;
 
-  const checkStatusAndLoad = async (docId: string) => {
-    try {
-      const res = await api.get(`/documents/${docId}/status`);
-      const status = res.data.status as DocProcessingStatus;
-      setDocStatus(status);
+        setDocStatus(data.status);
+        setStatusError(data.error_message ?? null);
+        setChunkCount(data.chunk_count ?? 0);
 
-      if (status === 'ocr_ready' || status === 'indexed') {
-        stopPolling();
-        loadReviewData(docId);
-      } else if (status === 'failed') {
-        stopPolling();
+        if (ACTIVE_STATUSES.includes(data.status)) {
+          // setTimeout, not setInterval: a slow response can never stack requests.
+          timer = setTimeout(tick, POLL_MS);
+        } else {
+          await loadReviewData(docId);
+          fetchDocuments();
+        }
+      } catch (err) {
+        if (cancelled) return;
+        console.error('Failed to check doc status', err);
+        setStatusError('Lost contact with the server — retrying…');
+        timer = setTimeout(tick, POLL_MS);
       }
-      // For 'uploaded' or 'processing', keep polling
-    } catch (err) {
-      console.error('Failed to check doc status', err);
-    }
-  };
+    };
 
-  const loadReviewData = async (docId: string) => {
-    setLoadingReview(true);
-    try {
-      const res = await api.get(`/documents/${docId}/review`);
-      setReviewData(res.data);
-      setDocStatus(res.data.status as DocProcessingStatus);
-      // Only set edited text if it's a new doc or text was empty
-      if (!editedText || activeReviewDocId !== docId) {
-        setEditedText(res.data.ocr_edited_text || res.data.ocr_raw_text || '');
-      }
-    } catch (err) {
-      console.error('Failed to fetch review data', err);
-    } finally {
-      setLoadingReview(false);
-    }
-  };
+    tick();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [docId, pollToken, loadReviewData, fetchDocuments]);
 
   const handleFileUpload = async (file: File) => {
-    setUploadState({ isUploading: true, uploadProgress: 10, uploadedDocId: null });
-
+    setUploadState({ isUploading: true, uploadProgress: 0, uploadedDocId: null });
     const formData = new FormData();
     formData.append('file', file);
 
     try {
-      // Simulate progress during actual upload
-      const progressInterval = setInterval(() => {
-        setUploadState((prev) => ({
-          ...prev,
-          uploadProgress: Math.min(prev.uploadProgress + 12, 90),
-        }));
-      }, 300);
-
-      const res = await api.post('/documents/upload', formData, {
+      const { data } = await api.post('/documents/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
+        onUploadProgress: (e) => {
+          const pct = e.total ? Math.round((e.loaded / e.total) * 100) : 0;
+          setUploadState((prev) => ({ ...prev, uploadProgress: pct }));
+        },
       });
 
-      clearInterval(progressInterval);
-      const newDocId = res.data.document_id;
+      setUploadState({ isUploading: false, uploadProgress: 100, uploadedDocId: data.document_id });
 
-      setUploadState({ isUploading: false, uploadProgress: 100, uploadedDocId: newDocId });
-
-      // Reset review state for the new document
+      // Clear the previous document's review state before the poller takes over.
       setReviewData(null);
       setEditedText('');
-      setActiveReviewDocId(newDocId);
+      setActiveReviewDocId(null);
+      activeDocRef.current = null;
+      setDocStatus('uploaded');
+      setStatusError(null);
 
-      // Navigate to review mode with the new doc ID
-      navigate(`/upload?doc=${newDocId}`, { replace: true });
+      navigate(`/upload?doc=${data.document_id}`, { replace: true });
       fetchDocuments();
     } catch (err: any) {
       setUploadState({ isUploading: false, uploadProgress: 0, uploadedDocId: null });
@@ -135,54 +149,41 @@ export const UploadReviewPage: React.FC = () => {
   };
 
   const handleConfirmAndIndex = async () => {
-    if (!reviewData) return;
-    setConfirming(true);
-    setDocStatus('processing');
-
+    if (!reviewData || !docId) return;
+    setSubmitting(true);
     try {
-      await api.put(`/documents/${reviewData.id}/confirm`, {
-        edited_text: editedText,
-      });
-
-      // Poll for indexing completion instead of immediately navigating
-      const indexPoll = setInterval(async () => {
-        try {
-          const res = await api.get(`/documents/${reviewData.id}/status`);
-          const status = res.data.status as DocProcessingStatus;
-          setDocStatus(status);
-
-          if (status === 'indexed') {
-            clearInterval(indexPoll);
-            setConfirming(false);
-            fetchDocuments();
-            // Update review data status locally
-            setReviewData((prev) => prev ? { ...prev, status: 'indexed' } : null);
-          } else if (status === 'failed') {
-            clearInterval(indexPoll);
-            setConfirming(false);
-            alert('Indexing failed. Please try again.');
-          }
-        } catch (e) {
-          console.error('Index status check failed', e);
-        }
-      }, 1500);
-
-      // Safety timeout — stop polling after 60s
-      setTimeout(() => {
-        clearInterval(indexPoll);
-        setConfirming(false);
-      }, 60000);
+      await api.put(`/documents/${docId}/confirm`, { edited_text: editedText });
+      setDocStatus('indexing');
+      setStatusError(null);
+      setPollToken((n) => n + 1); // restart the poller to follow indexing to completion
     } catch (err: any) {
-      setConfirming(false);
-      setDocStatus('ocr_ready');
       alert('Confirmation failed: ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setSubmitting(false);
     }
   };
 
-  const isProcessing = docStatus === 'uploaded' || docStatus === 'processing';
+  const handleRetry = async () => {
+    if (!docId) return;
+    setSubmitting(true);
+    try {
+      await api.post(`/documents/${docId}/reprocess`);
+      setDocStatus('uploaded');
+      setStatusError(null);
+      setPollToken((n) => n + 1); // restart the poller to follow the new OCR run
+    } catch (err: any) {
+      alert('Retry failed: ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const isOCRRunning = docStatus === 'uploaded' || docStatus === 'processing';
+  const isIndexing = docStatus === 'indexing';
   const isOCRReady = docStatus === 'ocr_ready';
   const isIndexed = docStatus === 'indexed';
   const isFailed = docStatus === 'failed';
+  const showPanels = reviewData && (isOCRReady || isIndexed || isIndexing);
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-6">
@@ -211,19 +212,18 @@ export const UploadReviewPage: React.FC = () => {
               <Upload className="w-6 h-6" />
             </div>
             <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
-              Click to upload or drag & drop file scan
+              Click to upload or drag &amp; drop file scan
             </p>
-            <p className="text-xs text-slate-400 mt-1">PaddleOCR executes multi-block text & layout extraction</p>
+            <p className="text-xs text-slate-400 mt-1">PaddleOCR executes multi-block text &amp; layout extraction</p>
           </label>
         </div>
 
-        {/* Upload Progress */}
         {uploadState.isUploading && (
           <div className="mt-4 p-4 rounded-xl bg-brand-50 dark:bg-brand-950/50 border border-brand-200 dark:border-brand-800">
             <div className="flex justify-between text-xs font-semibold text-brand-700 dark:text-brand-300 mb-1">
               <span className="flex items-center gap-2">
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                Uploading file...
+                Uploading file…
               </span>
               <span>{uploadState.uploadProgress}%</span>
             </div>
@@ -238,9 +238,8 @@ export const UploadReviewPage: React.FC = () => {
       </div>
 
       {/* Status + Review Panel */}
-      {selectedDocId && (
+      {docId && (
         <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-6 shadow-soft-sm space-y-4">
-          {/* Header with status and actions */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-4">
             <div>
               <div className="flex items-center gap-2">
@@ -249,34 +248,38 @@ export const UploadReviewPage: React.FC = () => {
                   {reviewData?.filename || 'Document OCR Review'}
                 </h3>
               </div>
-              <div className="flex items-center gap-2 mt-1">
+              <div className="flex items-center gap-2 mt-1 flex-wrap">
                 <span className="text-xs text-slate-500">Status:</span>
-                {isProcessing && (
+                {docStatus === null && (
+                  <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-slate-100 dark:bg-slate-800 text-slate-500 flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin" /> Checking…
+                  </span>
+                )}
+                {isOCRRunning && (
                   <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-300 border border-amber-200 dark:border-amber-800 flex items-center gap-1.5">
                     <Loader2 className="w-3 h-3 animate-spin" />
-                    {docStatus === 'uploaded' ? 'Queued for OCR...' : 'Running PaddleOCR...'}
+                    {STAGE_LABEL[docStatus!]}
                   </span>
                 )}
                 {isOCRReady && (
                   <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
-                    ✓ OCR Ready — Review & Confirm
+                    ✓ OCR Ready — Review &amp; Confirm
                   </span>
                 )}
-                {confirming && (
+                {isIndexing && (
                   <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 flex items-center gap-1.5">
                     <Loader2 className="w-3 h-3 animate-spin" />
-                    Indexing into vector store...
+                    {STAGE_LABEL.indexing}
                   </span>
                 )}
-                {isIndexed && !confirming && (
+                {isIndexed && (
                   <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
-                    ✓ Indexed — Ready for Chat
+                    ✓ Indexed — {chunkCount} chunks searchable
                   </span>
                 )}
                 {isFailed && (
                   <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-300 border border-rose-200 dark:border-rose-800 flex items-center gap-1.5">
-                    <AlertCircle className="w-3 h-3" />
-                    Failed
+                    <AlertCircle className="w-3 h-3" /> Failed
                   </span>
                 )}
               </div>
@@ -304,37 +307,38 @@ export const UploadReviewPage: React.FC = () => {
 
             <div className="flex items-center gap-2">
               <button
-                onClick={() => loadReviewData(selectedDocId)}
-                disabled={isProcessing}
+                onClick={() => loadReviewData(docId)}
+                disabled={isOCRRunning || isIndexing}
                 className="p-2 border border-slate-200 dark:border-slate-700 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300 text-xs font-semibold disabled:opacity-40"
                 title="Refresh OCR Data"
               >
                 <RefreshCw className="w-4 h-4" />
               </button>
 
-              {isOCRReady && (
+              {isFailed && (
                 <button
-                  onClick={handleConfirmAndIndex}
-                  disabled={confirming || loadingReview}
-                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-semibold rounded-xl text-xs shadow-soft-sm flex items-center gap-2 transition"
+                  onClick={handleRetry}
+                  disabled={submitting}
+                  className="px-4 py-2 bg-amber-600 hover:bg-amber-500 disabled:opacity-60 text-white font-semibold rounded-xl text-xs shadow-soft-sm flex items-center gap-2 transition"
                 >
-                  {confirming ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Indexing...</span>
-                    </>
-                  ) : (
-                    <>
-                      <CheckCircle className="w-4 h-4" />
-                      <span>Confirm & Index for Chat</span>
-                    </>
-                  )}
+                  <RotateCcw className="w-4 h-4" /> Retry Extraction
                 </button>
               )}
 
-              {isIndexed && !confirming && (
+              {(isOCRReady || isIndexed) && (
                 <button
-                  onClick={() => navigate(`/chat?doc=${selectedDocId}`)}
+                  onClick={handleConfirmAndIndex}
+                  disabled={submitting || loadingReview || !editedText.trim()}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-semibold rounded-xl text-xs shadow-soft-sm flex items-center gap-2 transition"
+                >
+                  {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+                  <span>{isIndexed ? 'Re-index with edits' : 'Confirm & Index for Chat'}</span>
+                </button>
+              )}
+
+              {isIndexed && (
+                <button
+                  onClick={() => navigate(`/chat?doc=${docId}`)}
                   className="px-4 py-2 bg-brand-600 hover:bg-brand-500 text-white font-semibold rounded-xl text-xs shadow-soft-sm flex items-center gap-2 transition"
                 >
                   💬 Chat with Document
@@ -343,8 +347,14 @@ export const UploadReviewPage: React.FC = () => {
             </div>
           </div>
 
-          {/* Processing spinner */}
-          {isProcessing && (
+          {statusError && (
+            <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-xs text-rose-700 dark:text-rose-300 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{statusError}</span>
+            </div>
+          )}
+
+          {(isOCRRunning || isIndexing) && (
             <div className="flex flex-col items-center justify-center py-16 space-y-4">
               <div className="relative">
                 <div className="w-16 h-16 rounded-full border-4 border-slate-200 dark:border-slate-800"></div>
@@ -352,38 +362,32 @@ export const UploadReviewPage: React.FC = () => {
               </div>
               <div className="text-center">
                 <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">
-                  {docStatus === 'uploaded' ? 'Queued — Waiting for OCR Engine...' : 'PaddleOCR is extracting text blocks...'}
+                  {STAGE_LABEL[docStatus!]}
                 </p>
                 <p className="text-xs text-slate-400 mt-1">
-                  This usually takes 5-15 seconds. The page will auto-update when ready.
+                  This page updates itself — large scanned PDFs can take a few minutes.
                 </p>
               </div>
             </div>
           )}
 
-          {/* Loading review data */}
-          {loadingReview && !isProcessing && (
+          {loadingReview && !isOCRRunning && !isIndexing && (
             <p className="py-12 text-center text-slate-400 text-sm flex items-center justify-center gap-2">
               <Loader2 className="w-4 h-4 animate-spin" />
-              Loading extracted blocks...
+              Loading extracted blocks…
             </p>
           )}
 
-          {/* Review Panels — only show when OCR is ready or indexed */}
-          {!isProcessing && !loadingReview && reviewData && (isOCRReady || isIndexed || confirming) && (
+          {showPanels && !loadingReview && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {/* Left Pane: Original Bounding Blocks */}
-              <div
-                className={`space-y-4 ${
-                  mobileTab === 'original' ? 'block' : 'hidden lg:block'
-                }`}
-              >
+              {/* Left Pane: Extracted Blocks */}
+              <div className={`space-y-4 ${mobileTab === 'original' ? 'block' : 'hidden lg:block'}`}>
                 <div className="flex items-center justify-between">
                   <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
-                    <Eye className="w-4 h-4 text-brand-500" /> Extracted Layout Blocks (PaddleOCR)
+                    <Eye className="w-4 h-4 text-brand-500" /> Extracted Layout Blocks
                   </h4>
                   <span className="text-xs bg-brand-50 dark:bg-brand-950 text-brand-600 dark:text-brand-300 px-2 py-0.5 rounded-full font-semibold">
-                    {reviewData.blocks?.length || 0} Text Blocks
+                    {reviewData.blocks?.length || 0} blocks · {reviewData.total_pages} page(s)
                   </span>
                 </div>
 
@@ -394,30 +398,38 @@ export const UploadReviewPage: React.FC = () => {
                         key={block.block_id}
                         className="p-3 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 text-xs shadow-soft-sm space-y-1"
                       >
-                        <div className="flex items-center justify-between text-slate-400">
-                          <span className="font-bold text-brand-500">Block #{block.block_id}</span>
-                          <span className="px-2 py-0.5 bg-emerald-50 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-300 font-semibold rounded-md">
-                            Confidence: {(block.confidence * 100).toFixed(0)}%
+                        <div className="flex items-center justify-between text-slate-400 gap-2">
+                          <span className="font-bold text-brand-500">
+                            Block #{block.block_id}
+                            {block.page ? ` · Page ${block.page}` : ''}
+                          </span>
+                          <span className="flex items-center gap-1.5">
+                            {block.source && (
+                              <span className="px-1.5 py-0.5 bg-slate-100 dark:bg-slate-800 text-slate-500 rounded-md">
+                                {block.source === 'paddleocr' ? 'OCR' : 'text layer'}
+                              </span>
+                            )}
+                            {typeof block.confidence === 'number' && (
+                              <span className="px-2 py-0.5 bg-emerald-50 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-300 font-semibold rounded-md">
+                                {(block.confidence * 100).toFixed(0)}%
+                              </span>
+                            )}
                           </span>
                         </div>
-                        <p className="text-slate-800 dark:text-slate-200 font-medium">{block.text}</p>
+                        <p className="text-slate-800 dark:text-slate-200 font-medium whitespace-pre-wrap">{block.text}</p>
                       </div>
                     ))
                   ) : (
-                    <p className="text-xs text-slate-400 text-center py-4">No blocks extracted yet.</p>
+                    <p className="text-xs text-slate-400 text-center py-4">No blocks extracted.</p>
                   )}
                 </div>
               </div>
 
-              {/* Right Pane: Editable Extracted Text */}
-              <div
-                className={`space-y-4 ${
-                  mobileTab === 'text' ? 'block' : 'hidden lg:block'
-                }`}
-              >
+              {/* Right Pane: Editable Text */}
+              <div className={`space-y-4 ${mobileTab === 'text' ? 'block' : 'hidden lg:block'}`}>
                 <div className="flex items-center justify-between">
                   <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
-                    <Edit3 className="w-4 h-4 text-emerald-500" /> Editable Extracted Text (Verify before indexing)
+                    <Edit3 className="w-4 h-4 text-emerald-500" /> Editable Extracted Text
                   </h4>
                   <span className="text-xs text-slate-400">
                     {editedText.split(/\s+/).filter(Boolean).length} words
@@ -428,10 +440,14 @@ export const UploadReviewPage: React.FC = () => {
                   value={editedText}
                   onChange={(e) => setEditedText(e.target.value)}
                   rows={18}
-                  disabled={isIndexed && !confirming}
+                  disabled={isIndexing}
                   className="w-full p-4 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl font-mono text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:border-brand-500 transition leading-relaxed disabled:opacity-60"
-                  placeholder="Review and edit OCR extracted text here..."
+                  placeholder="Review and edit OCR extracted text here…"
                 />
+                <p className="text-xs text-slate-400">
+                  Corrections here are what gets chunked and embedded. Editing an indexed
+                  document and re-indexing replaces its old chunks.
+                </p>
               </div>
             </div>
           )}

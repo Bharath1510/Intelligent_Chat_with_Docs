@@ -1,38 +1,48 @@
 import os
 import uuid
-import shutil
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from app.config import settings
-from app.db.base import get_db
-from app.db.models import Document
+from app.db.base import get_db, SessionLocal
+from app.db.models import Document, DocumentChunk
 from app.services.ocr_service import ocr_service
 from app.services.rag_service import rag_service
 from app.core.logging import logger
 
 router = APIRouter(prefix="/documents", tags=["Document Ingestion & OCR"])
 
+CHUNK_BYTES = 1024 * 1024
+
 
 class OCRConfirmPayload(BaseModel):
     edited_text: str
 
 
+def _fail(db: Session, document_id: str, message: str):
+    """Record a terminal failure so the UI can show why instead of spinning forever."""
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if doc:
+        doc.status = "failed"
+        doc.error_message = message
+        db.commit()
+
+
 def _run_ocr(document_id: str):
-    """Run OCR extraction synchronously (replaces Celery task)."""
-    from app.db.base import SessionLocal
+    """Extract text with PaddleOCR. Runs as a FastAPI background task."""
     db = SessionLocal()
     try:
         doc = db.query(Document).filter(Document.id == document_id).first()
         if not doc:
-            logger.error(f"Document {document_id} not found for OCR task")
+            logger.error(f"OCR task: document {document_id} not found")
             return
 
         doc.status = "processing"
+        doc.error_message = None
         db.commit()
+        logger.info(f"OCR started for {doc.filename} ({document_id})")
 
-        logger.info(f"Starting OCR extraction for file: {doc.file_path}")
         result = ocr_service.extract_text_from_file(doc.file_path)
 
         doc.ocr_raw_text = result.get("text", "")
@@ -40,36 +50,68 @@ def _run_ocr(document_id: str):
         doc.total_pages = result.get("total_pages", 1)
         doc.ocr_metadata = result.get("blocks", [])
         doc.status = "ocr_ready"
+        doc.error_message = None
         db.commit()
 
-        logger.info(f"OCR extraction finished for document {document_id}")
+        logger.info(
+            f"OCR finished for {doc.filename} ({document_id}): "
+            f"{len(doc.ocr_metadata)} blocks, {doc.total_pages} page(s), "
+            f"engine={result.get('metadata', {}).get('engine')}"
+        )
     except Exception as e:
-        logger.error(f"OCR task failed for document {document_id}: {e}")
-        try:
-            doc.status = "failed"
-            db.commit()
-        except Exception:
-            pass
+        logger.exception(f"OCR failed for document {document_id}: {e}")
+        _fail(db, document_id, f"OCR failed: {e}")
     finally:
         db.close()
 
 
 def _run_indexing(document_id: str):
-    """Run vector indexing synchronously (replaces Celery task)."""
-    from app.db.base import SessionLocal
+    """Chunk, embed and store vectors. Runs as a FastAPI background task."""
     db = SessionLocal()
     try:
-        logger.info(f"Starting indexing for document {document_id}")
+        logger.info(f"Indexing started for document {document_id}")
         chunks_indexed = rag_service.index_document(db, document_id)
-        logger.info(f"Indexed {chunks_indexed} chunks for document {document_id}")
+        logger.info(f"Indexing finished for document {document_id}: {chunks_indexed} chunks")
     except Exception as e:
-        logger.error(f"Indexing failed for document {document_id}: {e}")
-        doc = db.query(Document).filter(Document.id == document_id).first()
-        if doc:
-            doc.status = "failed"
-            db.commit()
+        logger.exception(f"Indexing failed for document {document_id}: {e}")
+        _fail(db, document_id, f"Indexing failed: {e}")
     finally:
         db.close()
+
+
+def _save_upload(file: UploadFile, file_path: str) -> int:
+    """Stream to disk, aborting if the file exceeds the configured limit."""
+    max_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
+    written = 0
+    try:
+        with open(file_path, "wb") as buffer:
+            while chunk := file.file.read(CHUNK_BYTES):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds the {settings.MAX_FILE_SIZE_MB}MB limit.",
+                    )
+                buffer.write(chunk)
+    except Exception:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise
+    return written
+
+
+def _serialize(doc: Document) -> dict:
+    return {
+        "id": doc.id,
+        "filename": doc.filename,
+        "file_size": doc.file_size,
+        "content_type": doc.content_type,
+        "status": doc.status,
+        "total_pages": doc.total_pages,
+        "error_message": doc.error_message,
+        "created_at": doc.created_at,
+        "updated_at": doc.updated_at,
+    }
 
 
 @router.post("/upload")
@@ -78,7 +120,7 @@ async def upload_document(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    ext = os.path.splitext(file.filename)[1].lower()
+    ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in settings.ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -86,13 +128,8 @@ async def upload_document(
         )
 
     file_id = str(uuid.uuid4())
-    stored_filename = f"{file_id}_{file.filename}"
-    file_path = os.path.join(settings.UPLOAD_DIR, stored_filename)
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    file_size = os.path.getsize(file_path)
+    file_path = os.path.join(settings.UPLOAD_DIR, f"{file_id}_{file.filename}")
+    file_size = _save_upload(file, file_path)
 
     doc = Document(
         id=file_id,
@@ -100,46 +137,29 @@ async def upload_document(
         file_path=file_path,
         file_size=file_size,
         content_type=file.content_type or "application/octet-stream",
-        status="uploaded"
+        status="uploaded",
     )
     db.add(doc)
     db.commit()
     db.refresh(doc)
 
-    # Run OCR in background (FastAPI BackgroundTasks replaces Celery)
+    logger.info(f"Upload accepted: {doc.filename} ({file_size} bytes), id={doc.id}")
     background_tasks.add_task(_run_ocr, doc.id)
 
     return {
         "message": "File uploaded successfully. OCR processing started.",
         "document_id": doc.id,
         "filename": doc.filename,
-        "status": doc.status
+        "status": doc.status,
     }
 
 
 @router.get("")
-def list_documents(
-    status_filter: Optional[str] = None,
-    db: Session = Depends(get_db),
-):
+def list_documents(status_filter: Optional[str] = None, db: Session = Depends(get_db)):
     query = db.query(Document)
     if status_filter:
         query = query.filter(Document.status == status_filter)
-
-    docs = query.order_by(Document.created_at.desc()).all()
-    return [
-        {
-            "id": d.id,
-            "filename": d.filename,
-            "file_size": d.file_size,
-            "content_type": d.content_type,
-            "status": d.status,
-            "total_pages": d.total_pages,
-            "created_at": d.created_at,
-            "updated_at": d.updated_at
-        }
-        for d in docs
-    ]
+    return [_serialize(d) for d in query.order_by(Document.created_at.desc()).all()]
 
 
 @router.get("/{document_id}")
@@ -147,7 +167,7 @@ def get_document(document_id: str, db: Session = Depends(get_db)):
     doc = db.query(Document).filter(Document.id == document_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    return doc
+    return _serialize(doc)
 
 
 @router.get("/{document_id}/status")
@@ -155,11 +175,16 @@ def get_document_status(document_id: str, db: Session = Depends(get_db)):
     doc = db.query(Document).filter(Document.id == document_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+
     return {
         "id": doc.id,
         "filename": doc.filename,
         "status": doc.status,
-        "total_pages": doc.total_pages
+        "total_pages": doc.total_pages,
+        "error_message": doc.error_message,
+        "chunk_count": db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == document_id
+        ).count(),
     }
 
 
@@ -176,7 +201,8 @@ def get_ocr_review_data(document_id: str, db: Session = Depends(get_db)):
         "ocr_raw_text": doc.ocr_raw_text or "",
         "ocr_edited_text": doc.ocr_edited_text or doc.ocr_raw_text or "",
         "blocks": doc.ocr_metadata or [],
-        "total_pages": doc.total_pages
+        "total_pages": doc.total_pages,
+        "error_message": doc.error_message,
     }
 
 
@@ -190,19 +216,44 @@ def confirm_and_index_document(
     doc = db.query(Document).filter(Document.id == document_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    if not payload.edited_text.strip():
+        raise HTTPException(status_code=400, detail="Cannot index an empty document.")
 
     doc.ocr_edited_text = payload.edited_text
-    doc.status = "processing"
+    doc.status = "indexing"
+    doc.error_message = None
     db.commit()
 
-    # Run indexing in background
+    logger.info(f"OCR text confirmed for {doc.filename} ({document_id}), indexing queued")
     background_tasks.add_task(_run_indexing, doc.id)
 
     return {
         "message": "OCR text saved. Indexing started.",
         "document_id": doc.id,
-        "status": doc.status
+        "status": doc.status,
     }
+
+
+@router.post("/{document_id}/reprocess")
+def reprocess_document(
+    document_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Re-run OCR — the way out of a failed or interrupted extraction."""
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not os.path.exists(doc.file_path):
+        raise HTTPException(status_code=410, detail="The uploaded file is no longer on disk.")
+
+    doc.status = "uploaded"
+    doc.error_message = None
+    db.commit()
+
+    logger.info(f"Reprocess requested for {doc.filename} ({document_id})")
+    background_tasks.add_task(_run_ocr, doc.id)
+    return {"message": "Reprocessing started.", "document_id": doc.id, "status": doc.status}
 
 
 @router.delete("/{document_id}")
@@ -211,14 +262,15 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Remove physical file if exists
+    filename = doc.filename
     if os.path.exists(doc.file_path):
         try:
             os.remove(doc.file_path)
         except Exception as e:
-            logger.warning(f"File delete error: {e}")
+            logger.warning(f"Could not delete file for {document_id}: {e}")
 
     db.delete(doc)
     db.commit()
 
+    logger.info(f"Deleted document {filename} ({document_id}) and its chunks")
     return {"message": "Document deleted successfully"}

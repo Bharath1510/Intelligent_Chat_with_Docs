@@ -17,14 +17,28 @@ class Settings(BaseSettings):
     # AI / Gemini
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
-    GEMINI_EMBEDDING_MODEL: str = "text-embedding-004"
+    # text-embedding-004 was retired and now 404s — the API silently degraded to
+    # local vectors until this was corrected.
+    GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-001"
+    EMBEDDING_DIMENSION: int = 768
     
     # Storage
     UPLOAD_DIR: str = os.path.join(os.getcwd(), "storage_uploads")
+
+    TESTING: bool = False
+
+    # OCR tuning knobs
+    OCR_LANG: str = "en"
+    # Leave off until paddle fixes its oneDNN kernel; on this CPU it crashes detection.
+    OCR_ENABLE_MKLDNN: bool = False
     
     # Limits
     MAX_FILE_SIZE_MB: int = 25
     ALLOWED_EXTENSIONS: List[str] = [".pdf", ".png", ".jpg", ".jpeg", ".tiff"]
+
+    # Retrieval: floor that drops pure noise. Grounding is enforced by the system
+    # prompt, so this stays low — cosine ranges differ a lot between embedders.
+    RETRIEVAL_MIN_SIMILARITY: float = 0.05
 
     model_config = SettingsConfigDict(env_file=_env_file, extra="ignore")
 

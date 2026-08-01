@@ -1,6 +1,10 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import { api } from '../services/api';
-import { DocumentItem, OCRReviewData } from '../types';
+import { DocumentItem, OCRReviewData, DocProcessingStatus } from '../types';
+
+// While any document is mid-pipeline, every page showing the list needs to keep up.
+const ACTIVE_STATUSES: DocProcessingStatus[] = ['uploaded', 'processing', 'indexing'];
+const REFRESH_MS = 3000;
 
 interface UploadState {
   isUploading: boolean;
@@ -57,6 +61,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setDocumentsLoading(false);
     }
   }, []);
+
+  // Keep the shared list live so dashboard/library badges don't go stale mid-pipeline.
+  const hasActiveWork = documents.some((d) => ACTIVE_STATUSES.includes(d.status));
+  useEffect(() => {
+    if (!hasActiveWork) return;
+    const timer = setInterval(fetchDocuments, REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [hasActiveWork, fetchDocuments]);
 
   return (
     <AppContext.Provider

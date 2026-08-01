@@ -1,14 +1,25 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
+import { api } from '../services/api';
+import { StatusBadge } from '../components/StatusBadge';
 import { FileText, MessageSquare, HardDrive, Upload, ArrowRight, CheckCircle2, Clock } from 'lucide-react';
+
+interface EngineHealth {
+  ocr: { engine: string; available: boolean; error?: string | null };
+  llm: { model: string; configured: boolean };
+}
 
 export const DashboardPage: React.FC = () => {
   const { documents, documentsLoading, fetchDocuments } = useApp();
   const navigate = useNavigate();
+  const [health, setHealth] = useState<EngineHealth | null>(null);
 
   useEffect(() => {
     fetchDocuments();
+    api.get('/health')
+      .then((res) => setHealth(res.data))
+      .catch(() => setHealth(null));
   }, [fetchDocuments]);
 
   const totalIndexed = documents.filter((d) => d.status === 'indexed').length;
@@ -82,8 +93,20 @@ export const DashboardPage: React.FC = () => {
               <Clock className="w-5 h-5" />
             </div>
           </div>
-          <p className="text-2xl font-bold mt-2 text-slate-900 dark:text-white">PaddleOCR</p>
-          <span className="text-xs text-emerald-500 font-medium">Ready</span>
+          <p className="text-2xl font-bold mt-2 text-slate-900 dark:text-white">
+            {health?.ocr.engine || 'PaddleOCR'}
+          </p>
+          {health === null ? (
+            <span className="text-xs text-slate-400 font-medium">Checking…</span>
+          ) : health.ocr.available ? (
+            <span className="text-xs text-emerald-500 font-medium">
+              Ready · {health.llm.configured ? health.llm.model : 'local embeddings'}
+            </span>
+          ) : (
+            <span className="text-xs text-rose-500 font-medium" title={health.ocr.error || ''}>
+              Unavailable — scans cannot be read
+            </span>
+          )}
         </div>
       </div>
 
@@ -126,31 +149,12 @@ export const DashboardPage: React.FC = () => {
                       <span className="truncate max-w-xs">{doc.filename}</span>
                     </td>
                     <td className="py-3">
-                      <span
-                        className={`text-xs px-2.5 py-1 rounded-full font-semibold capitalize border ${
-                          doc.status === 'indexed'
-                            ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
-                            : doc.status === 'ocr_ready'
-                            ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-300 border-blue-200 dark:border-blue-800'
-                            : doc.status === 'failed'
-                            ? 'bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-300 border-rose-200 dark:border-rose-800'
-                            : 'bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-300 border-amber-200 dark:border-amber-800'
-                        }`}
-                      >
-                        {doc.status.replace('_', ' ')}
-                      </span>
+                      <StatusBadge status={doc.status} title={doc.error_message} />
                     </td>
                     <td className="py-3 text-slate-500 text-xs">{(doc.file_size / 1024).toFixed(1)} KB</td>
                     <td className="py-3 text-slate-500 text-xs">{doc.total_pages}</td>
                     <td className="py-3 text-right">
-                      {doc.status === 'ocr_ready' || doc.status === 'processing' || doc.status === 'uploaded' ? (
-                        <button
-                          onClick={() => navigate(`/upload?doc=${doc.id}`)}
-                          className="px-3 py-1 bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold rounded-lg"
-                        >
-                          Review OCR
-                        </button>
-                      ) : doc.status === 'indexed' ? (
+                      {doc.status === 'indexed' ? (
                         <button
                           onClick={() => navigate(`/chat?doc=${doc.id}`)}
                           className="px-3 py-1 bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold rounded-lg"
@@ -158,7 +162,12 @@ export const DashboardPage: React.FC = () => {
                           Chat
                         </button>
                       ) : (
-                        <span className="text-xs text-slate-400">—</span>
+                        <button
+                          onClick={() => navigate(`/upload?doc=${doc.id}`)}
+                          className="px-3 py-1 bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold rounded-lg"
+                        >
+                          {doc.status === 'failed' ? 'Retry' : 'Review OCR'}
+                        </button>
                       )}
                     </td>
                   </tr>

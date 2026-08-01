@@ -1,122 +1,199 @@
 import os
-import re
-from typing import Dict, Any, List
-from PIL import Image, ImageEnhance
+from typing import Dict, Any, List, Optional
+from app.config import settings
 from app.core.logging import logger
+
+
+class OCRUnavailableError(RuntimeError):
+    """No OCR engine available to read a scanned page."""
+
+
+class OCRExtractionError(RuntimeError):
+    """The file was read but yielded no usable text."""
+
+
+# ponytail: a PDF page with fewer than this many chars has no real text layer -> rasterize + OCR.
+MIN_TEXT_LAYER_CHARS = 32
+# ponytail: 200 DPI is the accuracy/speed knee for PP-OCR; raise it if small print is missed.
+RASTER_DPI = 200
+
+PAGE_MARKER = "--- Page {n} ---"
+
+
+def _jsonable(value):
+    """Bounding boxes come back as numpy arrays; JSON columns need plain lists."""
+    if value is None:
+        return None
+    tolist = getattr(value, "tolist", None)
+    return tolist() if callable(tolist) else value
 
 
 class OCRService:
     def __init__(self):
-        self._paddle_ocr = None
+        self._paddle = None
+        self._init_error: Optional[str] = None
         self._initialized = False
 
-    def _init_paddle(self):
-        if not self._initialized:
-            try:
-                from paddleocr import PaddleOCR
-                self._paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-                self._initialized = True
-                logger.info("PaddleOCR engine initialized successfully.")
-            except Exception as e:
-                logger.warning(f"PaddleOCR native initialization warning: {e}. Falling back to image-enhancement OCR parser.")
-                self._initialized = True
-                self._paddle_ocr = None
+    def _engine(self):
+        """Lazy-init PaddleOCR. Returns the engine, or None if it could not start."""
+        if self._initialized:
+            return self._paddle
+
+        self._initialized = True
+        try:
+            from paddleocr import PaddleOCR
+            # PaddleOCR 3.x arg names: use_angle_cls/show_log were removed.
+            # mkldnn off: paddle 3.3.1 on this CPU raises ConvertPirAttribute2RuntimeAttribute
+            # during text detection. Turn it back on once paddle fixes the oneDNN kernel.
+            self._paddle = PaddleOCR(
+                use_textline_orientation=True,
+                lang=settings.OCR_LANG,
+                enable_mkldnn=settings.OCR_ENABLE_MKLDNN,
+            )
+            logger.info(f"PaddleOCR engine initialized (lang={settings.OCR_LANG}).")
+        except Exception as e:
+            self._init_error = f"{type(e).__name__}: {e}"
+            logger.error(
+                f"PaddleOCR is unavailable, scanned pages cannot be read: {self._init_error}"
+            )
+        return self._paddle
+
+    def engine_status(self) -> Dict[str, Any]:
+        """Reported by /health so the UI never claims an engine that isn't loaded."""
+        return {
+            "engine": "PaddleOCR",
+            "available": self._engine() is not None,
+            "error": self._init_error,
+        }
 
     def extract_text_from_file(self, file_path: str) -> Dict[str, Any]:
-        """
-        Extracts text, bounding boxes, and metadata from PDF or Image file.
-        """
-        self._init_paddle()
+        """Extract text, per-block confidence and page numbers from a PDF or image."""
         ext = os.path.splitext(file_path)[1].lower()
-        
         if ext == ".pdf":
             return self._process_pdf(file_path)
-        else:
-            return self._process_image(file_path)
+        return self._process_image(file_path)
+
+    def _ocr_blocks(self, source, page: int, first_block_id: int) -> List[Dict[str, Any]]:
+        """Run PaddleOCR over one image (path or numpy array) and normalize its output."""
+        engine = self._engine()
+        if engine is None:
+            raise OCRUnavailableError(
+                f"PaddleOCR engine is not available ({self._init_error}). "
+                "Install paddlepaddle to read scanned pages."
+            )
+
+        # 3.x exposes predict(); older builds only have ocr().
+        raw = engine.predict(source) if hasattr(engine, "predict") else engine.ocr(source)
+
+        blocks: List[Dict[str, Any]] = []
+        for result in raw or []:
+            if isinstance(result, dict):
+                texts = result.get("rec_texts") or []
+                scores = result.get("rec_scores") or []
+                polys = result.get("rec_polys") or result.get("dt_polys") or []
+                rows = zip(texts, scores, list(polys) + [None] * (len(texts) - len(polys)))
+            else:
+                # PaddleOCR 2.x shape: [[bbox, (text, score)], ...]
+                rows = ((line[1][0], line[1][1], line[0]) for line in result or [])
+
+            for text, score, poly in rows:
+                if not str(text).strip():
+                    continue
+                blocks.append({
+                    "block_id": first_block_id + len(blocks),
+                    "page": page,
+                    "text": str(text),
+                    "confidence": round(float(score), 3) if score is not None else None,
+                    "bbox": _jsonable(poly),
+                    "source": "paddleocr",
+                })
+        return blocks
 
     def _process_image(self, image_path: str) -> Dict[str, Any]:
-        extracted_blocks = []
-        full_text_lines = []
+        blocks = self._ocr_blocks(image_path, page=1, first_block_id=1)
+        if not blocks:
+            raise OCRExtractionError("PaddleOCR found no readable text in this image.")
 
-        if self._paddle_ocr:
-            try:
-                result = self._paddle_ocr.ocr(image_path, cls=True)
-                if result and result[0]:
-                    for idx, line in enumerate(result[0]):
-                        box, (text, confidence) = line
-                        full_text_lines.append(text)
-                        extracted_blocks.append({
-                            "block_id": idx + 1,
-                            "bbox": box,
-                            "text": text,
-                            "confidence": round(float(confidence), 3)
-                        })
-                    return {
-                        "text": "\n".join(full_text_lines),
-                        "total_pages": 1,
-                        "blocks": extracted_blocks,
-                        "metadata": {"engine": "PaddleOCR"}
-                    }
-            except Exception as e:
-                logger.warning(f"PaddleOCR processing error: {e}")
-
-        # Enhanced Fallback OCR Reader
-        return self._fallback_image_extraction(image_path)
+        logger.info(f"OCR read {len(blocks)} blocks from image {os.path.basename(image_path)}")
+        return {
+            "text": "\n".join(b["text"] for b in blocks),
+            "total_pages": 1,
+            "blocks": blocks,
+            "metadata": {"engine": "PaddleOCR", "ocr_pages": 1, "text_layer_pages": 0},
+        }
 
     def _process_pdf(self, pdf_path: str) -> Dict[str, Any]:
-        # Try PDF text extraction / PyPDF or fallback
-        full_text_pages = []
-        blocks = []
+        """
+        Use the embedded text layer where the PDF has one (fast and exact),
+        and fall back to rasterize + PaddleOCR only for pages that are scans.
+        """
+        from pypdf import PdfReader
 
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(pdf_path)
-            total_pages = len(reader.pages)
-            for p_idx, page in enumerate(reader.pages, 1):
-                p_text = page.extract_text() or ""
-                if p_text.strip():
-                    full_text_pages.append(f"--- Page {p_idx} ---\n{p_text}")
-                    blocks.append({
-                        "page": p_idx,
-                        "block_id": p_idx,
-                        "text": p_text,
-                        "confidence": 0.98
-                    })
+        reader = PdfReader(pdf_path)
+        total_pages = len(reader.pages)
 
-            if full_text_pages:
-                return {
-                    "text": "\n\n".join(full_text_pages),
-                    "total_pages": total_pages,
-                    "blocks": blocks,
-                    "metadata": {"engine": "PdfReader"}
-                }
-        except Exception as e:
-            logger.info(f"PyPDF extraction note: {e}")
+        blocks: List[Dict[str, Any]] = []
+        page_texts: List[str] = []
+        rendered = None
+        ocr_pages = 0
+        text_layer_pages = 0
 
-        # Fallback structured text for mock/demo PDFs
-        filename = os.path.basename(pdf_path)
+        for page_no, page in enumerate(reader.pages, 1):
+            try:
+                layer = (page.extract_text() or "").strip()
+            except Exception as e:
+                logger.warning(f"Text-layer read failed on page {page_no}: {e}")
+                layer = ""
+
+            if len(layer) >= MIN_TEXT_LAYER_CHARS:
+                text_layer_pages += 1
+                blocks.append({
+                    "block_id": len(blocks) + 1,
+                    "page": page_no,
+                    "text": layer,
+                    "confidence": 1.0,
+                    "bbox": None,
+                    "source": "pdf_text_layer",
+                })
+                page_texts.append(f"{PAGE_MARKER.format(n=page_no)}\n{layer}")
+                continue
+
+            # No text layer: this page is a scan, so it needs real OCR.
+            if rendered is None:
+                import pypdfium2 as pdfium
+                rendered = pdfium.PdfDocument(pdf_path)
+
+            import numpy as np
+            image = rendered[page_no - 1].render(scale=RASTER_DPI / 72).to_pil().convert("RGB")
+            page_blocks = self._ocr_blocks(np.asarray(image), page_no, len(blocks) + 1)
+            if page_blocks:
+                ocr_pages += 1
+                blocks.extend(page_blocks)
+                joined = "\n".join(b["text"] for b in page_blocks)
+                page_texts.append(f"{PAGE_MARKER.format(n=page_no)}\n{joined}")
+
+        if rendered is not None:
+            rendered.close()
+
+        if not page_texts:
+            raise OCRExtractionError(
+                f"No text could be extracted from any of the {total_pages} page(s)."
+            )
+
+        logger.info(
+            f"PDF extraction complete: {total_pages} pages "
+            f"({text_layer_pages} via text layer, {ocr_pages} via PaddleOCR), {len(blocks)} blocks"
+        )
         return {
-            "text": f"Document: {filename}\nExtracted Content:\nSection 1: OCR and RAG Architecture Overview.\nSection 2: PaddleOCR extracts multi-language scanned pages and table structures.\nSection 3: LangChain handles chunking and vector retrieval via embeddings.\nSection 4: Responses are strictly grounded with source citations.",
-            "total_pages": 1,
-            "blocks": [{"block_id": 1, "text": "OCR RAG document text", "confidence": 0.95}],
-            "metadata": {"engine": "FallbackExtractor"}
+            "text": "\n\n".join(page_texts),
+            "total_pages": total_pages,
+            "blocks": blocks,
+            "metadata": {
+                "engine": "PaddleOCR" if ocr_pages else "PdfTextLayer",
+                "ocr_pages": ocr_pages,
+                "text_layer_pages": text_layer_pages,
+            },
         }
 
-    def _fallback_image_extraction(self, image_path: str) -> Dict[str, Any]:
-        filename = os.path.basename(image_path)
-        return {
-            "text": f"Extracted Text from Image ({filename}):\n"
-                    f"1. Executive Summary: OCR + RAG Document Chat Platform.\n"
-                    f"2. Core Architecture: FastAPI backend, React UI, vector search, LangChain.\n"
-                    f"3. Features: PaddleOCR text extraction, side-by-side OCR review, RAG chat with citations.\n"
-                    f"4. Status: Confirmed scan verified with high confidence.",
-            "total_pages": 1,
-            "blocks": [
-                {"block_id": 1, "text": "Executive Summary: OCR + RAG Document Chat Platform.", "confidence": 0.96},
-                {"block_id": 2, "text": "Core Architecture: FastAPI backend, React UI, vector search, LangChain.", "confidence": 0.94},
-                {"block_id": 3, "text": "Features: PaddleOCR text extraction, RAG chat with citations.", "confidence": 0.97}
-            ],
-            "metadata": {"engine": "ImageFallbackProcessor"}
-        }
 
 ocr_service = OCRService()

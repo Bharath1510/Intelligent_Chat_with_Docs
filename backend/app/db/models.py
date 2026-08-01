@@ -1,9 +1,14 @@
 import uuid
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import Column, String, DateTime, ForeignKey, Text, Integer, JSON
 from sqlalchemy.orm import relationship
 from app.db.base import Base
+
+
+def _utcnow():
+    """Naive UTC, matching the existing column values; utcnow() is deprecated in 3.12+."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Document(Base):
@@ -14,13 +19,15 @@ class Document(Base):
     file_path = Column(String(512), nullable=False)
     file_size = Column(Integer, nullable=False)
     content_type = Column(String(100), nullable=False)
-    status = Column(String(50), default="uploaded")  # uploaded, processing, ocr_ready, indexed, failed
+    # uploaded -> processing (OCR) -> ocr_ready -> indexing -> indexed | failed
+    status = Column(String(50), default="uploaded")
     ocr_raw_text = Column(Text, nullable=True)
     ocr_edited_text = Column(Text, nullable=True)
     total_pages = Column(Integer, default=1)
     ocr_metadata = Column(JSON, nullable=True)  # bounding boxes, confidence per block
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    error_message = Column(Text, nullable=True)  # why status == "failed", shown in the UI
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
 
@@ -35,7 +42,7 @@ class DocumentChunk(Base):
     chunk_text = Column(Text, nullable=False)
     embedding_json = Column(Text, nullable=True)  # JSON-serialized float vector (SQLite-compatible)
     chunk_metadata = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     document = relationship("Document", back_populates="chunks")
 
@@ -61,8 +68,8 @@ class ChatSession(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     title = Column(String(255), default="New Chat")
     document_ids = Column(JSON, nullable=True)  # List of scoped doc IDs, null/empty = all docs
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
 
@@ -75,6 +82,6 @@ class ChatMessage(Base):
     sender = Column(String(50), nullable=False)  # user, assistant
     text = Column(Text, nullable=False)
     citations = Column(JSON, nullable=True)  # [{doc_id, filename, page_number, snippet}]
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     session = relationship("ChatSession", back_populates="messages")

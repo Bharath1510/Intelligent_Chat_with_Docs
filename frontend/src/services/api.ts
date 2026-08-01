@@ -44,23 +44,25 @@ export function streamChatQuery(
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const dataStr = line.replace('data: ', '').trim();
-            try {
-              const data = JSON.parse(dataStr);
-              if (data.type === 'token') {
-                onToken(data.content);
-              } else if (data.type === 'citations') {
-                onCitations(data.content);
-              } else if (data.type === 'done') {
-                if (!doneEmitted) {
-                  doneEmitted = true;
-                  onDone();
-                }
+          if (!line.startsWith('data: ')) continue;
+          // slice, not replace: replace() would also strip a "data: " inside the payload
+          const dataStr = line.slice(6).trim();
+          try {
+            const data = JSON.parse(dataStr);
+            if (data.type === 'token') {
+              onToken(data.content);
+            } else if (data.type === 'citations') {
+              onCitations(data.content);
+            } else if (data.type === 'error') {
+              onError(new Error(data.content || 'The server failed while answering.'));
+            } else if (data.type === 'done') {
+              if (!doneEmitted) {
+                doneEmitted = true;
+                onDone();
               }
-            } catch (e) {
-              // Ignore non-JSON line
             }
+          } catch {
+            // Ignore non-JSON line
           }
         }
       }

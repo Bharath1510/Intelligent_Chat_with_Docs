@@ -83,7 +83,8 @@ Upload PDF/Image
 ## 🚀 Quick Start
 
 ### Prerequisites
-- **Python 3.10+** with pip
+- **Python 3.10 – 3.12** with pip — **not 3.13/3.14**: `paddlepaddle` (the engine
+  behind PaddleOCR) publishes no wheels for them, and without it every scan fails.
 - **Node.js 18+** with npm
 
 ### 1. Clone & Setup Backend
@@ -91,17 +92,29 @@ Upload PDF/Image
 ```bash
 cd backend
 
-# Create virtual environment
-python -m venv venv
+# Create virtual environment (use a 3.12 interpreter explicitly if it isn't your default)
+py -3.12 -m venv venv    # Windows
+python3.12 -m venv venv  # Mac/Linux
 
 # Activate (Windows)
 venv\Scripts\activate
 # Activate (Mac/Linux)
 source venv/bin/activate
 
-# Install dependencies
+# Install dependencies (first run downloads the PP-OCR models, ~100MB)
 pip install -r requirements.txt
 ```
+
+Verify the OCR engine actually loaded before uploading anything — `GET /health`
+reports `ocr.available`, and the dashboard shows the same state:
+
+```bash
+curl http://localhost:8000/health
+# {"status":"healthy","ocr":{"engine":"PaddleOCR","available":true,"error":null}, ...}
+```
+
+If it reports `degraded`, OCR is not running and scans will fail with an explicit
+error rather than silently producing placeholder text.
 
 ### 2. Configure Environment
 
@@ -111,7 +124,9 @@ cp .env.example .env
 # Edit .env and paste your key from https://aistudio.google.com/apikey
 ```
 
-> **Note:** The app works fully without a Gemini API key — it uses deterministic local embeddings and grounded mock responses. Add the key for live AI-powered chat.
+> **Note:** The app works without a Gemini API key — it falls back to local lexical
+> embeddings and answers by quoting the best-matching retrieved passage. Add the key
+> for synthesized answers. OCR itself never depends on the key.
 
 ### 3. Start Backend
 
@@ -168,9 +183,9 @@ OCR_Project/
 | Layer | Technology | Purpose |
 |---|---|---|
 | **Backend** | FastAPI (async) | High-performance REST API with SSE streaming |
-| **OCR** | PaddleOCR + PyPDF | Multi-engine text extraction with fallback |
+| **OCR** | PaddleOCR + PyPDF | PDF text layer where present, PaddleOCR on scanned pages |
 | **RAG** | LangChain | Recursive text chunking + prompt templating |
-| **Embeddings** | Google Gemini `text-embedding-004` | 768-dim semantic vectors |
+| **Embeddings** | Google Gemini `gemini-embedding-001` | 768-dim semantic vectors (batched) |
 | **Search** | Cosine similarity + BM25 RRF | Hybrid retrieval for accuracy |
 | **Generation** | Google Gemini `gemini-2.5-flash` | Grounded response generation |
 | **Database** | SQLite + SQLAlchemy | Zero-config persistent storage |
@@ -187,8 +202,25 @@ OCR_Project/
 3. Add it to your `.env` file: `GEMINI_API_KEY=your-key-here`
 
 Without a key, the app still works using:
-- **Deterministic hash-based embeddings** for vector similarity
-- **Grounded mock responses** that quote directly from retrieved document chunks
+- **Local lexical embeddings** (hashed bag-of-words) so cosine similarity still
+  tracks real word overlap and retrieval returns useful passages
+- **Grounded extract responses** that quote directly from retrieved document chunks
+
+Chunks record which embedding model produced them. Vectors from different models
+are not comparable, so after switching models a document must be re-indexed —
+retrieval skips mismatched chunks and logs a warning naming the affected files.
+
+## 🔁 Document Lifecycle
+
+```
+uploaded → processing (PaddleOCR) → ocr_ready → indexing → indexed
+                    │                              │
+                    └──────────► failed ◄──────────┘   (POST /documents/{id}/reprocess to retry)
+```
+
+Background work dies with the process, so anything left in `processing` or
+`indexing` when the server restarts is marked `failed` with a reason on startup
+rather than spinning in the UI forever.
 
 ---
 
