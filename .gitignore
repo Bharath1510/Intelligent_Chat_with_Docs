@@ -1,0 +1,58 @@
+# =====================
+# Python / Backend
+# =====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+backend/venv/
+venv/
+.venv/
+
+# SQLite databases
+*.db
+*.sqlite3
+
+# Uploaded files storage
+backend/storage_uploads/
+
+# Environment variables (contains API keys)
+.env
+
+# =====================
+# Node / Frontend
+# =====================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# =====================
+# IDE / Editor
+# =====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# =====================
+# OS
+# =====================
+*.log
+*.pid
+*.seed
+
+# =====================
+# Misc
+# =====================
+.agents/
