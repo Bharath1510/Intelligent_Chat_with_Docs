@@ -194,4 +194,4 @@ Without a key, the app still works using:
 
 ## 📜 License
 
-This is a personal portfolio project built by **Bharath**.
+This is a personal portfolio project.
