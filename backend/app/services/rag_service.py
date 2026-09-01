@@ -13,7 +13,7 @@ from app.core.logging import logger
 from app.core.sanitizer import sanitize_ocr_text, format_grounded_context
 from app.db.models import Document
 from app.db.vector_store import SQLiteVectorRepository
-from app.services.embedding_service import embedding_service
+from app.services.embedding_service import embedding_service, EmbeddingProviderError
 
 _thread_pool = ThreadPoolExecutor(max_workers=4)
 
@@ -117,9 +117,28 @@ class RAGService:
     ) -> AsyncGenerator[str, None]:
         """Stream RAG chat tokens and citations as SSE JSON objects."""
         loop = asyncio.get_running_loop()
-        retrieved_chunks = await loop.run_in_executor(
-            _thread_pool, lambda: self.retrieve_relevant_chunks(db, query, top_k=4, doc_ids=doc_ids)
-        )
+        try:
+            retrieved_chunks = await loop.run_in_executor(
+                _thread_pool,
+                lambda: self.retrieve_relevant_chunks(db, query, top_k=4, doc_ids=doc_ids),
+            )
+        except EmbeddingProviderError as e:
+            # The question itself could not be embedded, so no search happened.
+            # Say that plainly instead of leaking a provider quota dump.
+            logger.warning(f"Query embedding failed: {e}")
+            message = (
+                "The embedding service is rate limited right now, so I couldn't search "
+                "your documents. Wait about a minute and ask again."
+                if e.rate_limited
+                else "The embedding service is unavailable, so I couldn't search your "
+                     "documents. Please try again shortly."
+            )
+            for group in self._chunk_text_tokens(message):
+                yield self._sse({"type": "token", "content": group})
+                await asyncio.sleep(0.02)
+            yield self._sse({"type": "citations", "content": []})
+            yield self._sse({"type": "done"})
+            return
 
         max_similarity = max((c.get("similarity", 0) for c in retrieved_chunks), default=0.0)
         logger.info(
@@ -128,11 +147,24 @@ class RAGService:
         )
 
         if not retrieved_chunks or max_similarity < self.min_confidence_threshold:
-            fallback_msg = (
-                "I couldn't find anything relevant in your indexed documents to answer that. "
-                "Make sure the document you want to ask about has finished indexing, "
-                "then try rephrasing the question."
+            # Distinguish "nothing matched" from "the document is invisible to search",
+            # which otherwise looks identical to the user.
+            stale = await loop.run_in_executor(
+                _thread_pool, lambda: self.vector_repo.stale_document_names(db, doc_ids)
             )
+            if stale:
+                fallback_msg = (
+                    f"{', '.join(stale)} was indexed with a different embedding model, "
+                    "so it cannot be searched right now. Open it in Upload & Review and "
+                    "choose 'Re-index with edits' to rebuild it, then ask again."
+                )
+                logger.warning(f"Query blocked by stale embeddings in: {', '.join(stale)}")
+            else:
+                fallback_msg = (
+                    "I couldn't find anything relevant in your indexed documents to answer that. "
+                    "Make sure the document you want to ask about has finished indexing, "
+                    "then try rephrasing the question."
+                )
             for group in self._chunk_text_tokens(fallback_msg):
                 yield self._sse({"type": "token", "content": group})
                 await asyncio.sleep(0.02)

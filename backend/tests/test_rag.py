@@ -44,6 +44,64 @@ def test_cosine_similarity_handles_empty_vectors():
     assert SQLiteVectorRepository._cosine_similarity([], [1.0, 2.0]) == 0.0
 
 
+def test_active_model_resolves_provider_before_reporting(monkeypatch):
+    """
+    Chunks are labelled with active_model *before* they are embedded. If reading it
+    doesn't initialise the provider first, the first document indexed after a
+    restart gets Gemini vectors labelled 'local', and retrieval then filters that
+    document out entirely — it indexes fine but can never answer.
+    """
+    from app.services import embedding_service as mod
+
+    import google.genai
+
+    service = mod.EmbeddingService()
+    monkeypatch.setattr(mod.settings, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(mod.settings, "GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+    monkeypatch.setattr(google.genai, "Client", lambda **kwargs: object())
+
+    # Read it cold, exactly as index_document does before embedding anything.
+    assert service.active_model == "gemini-embedding-001"
+
+
+def test_configured_provider_failure_raises_instead_of_degrading(monkeypatch):
+    """
+    A transient Gemini error must not silently produce local vectors: the document
+    would be stored as 'indexed' while being unsearchable next to Gemini-embedded
+    ones. It must fail so the caller can mark it failed and offer a retry.
+    """
+    from app.services.embedding_service import EmbeddingService, EmbeddingProviderError
+
+    service = EmbeddingService()
+    service._initialized = True
+    service.active_model = "gemini-embedding-001"
+
+    class BoomClient:
+        class models:
+            @staticmethod
+            def embed_content(**kwargs):
+                raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+    service._genai_client = BoomClient()
+    monkeypatch.setattr("app.services.embedding_service.EMBED_BACKOFF_SECONDS", 0)
+
+    with pytest.raises(EmbeddingProviderError, match="unavailable after"):
+        service.embed_documents(["some chunk text"])
+
+
+def test_no_provider_configured_still_uses_local_vectors():
+    """Local embedding is a supported mode when no key is set, not an error."""
+    from app.services.embedding_service import EmbeddingService
+
+    service = EmbeddingService()
+    service._initialized = True
+    service._genai_client = None
+
+    vectors = service.embed_documents(["alpha beta", "gamma"])
+    assert len(vectors) == 2
+    assert any(v != 0.0 for v in vectors[0])
+
+
 @pytest.mark.parametrize("blocks", [[], None])
 def test_ocr_service_never_invents_text(blocks):
     """

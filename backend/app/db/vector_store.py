@@ -52,6 +52,21 @@ class SQLiteVectorRepository(VectorStoreRepository):
         db.commit()
         return chunk_ids
 
+    def stale_document_names(self, db: Session, doc_ids: Optional[List[str]] = None) -> List[str]:
+        """
+        Documents in scope whose chunks were embedded by a different model, so they
+        are invisible to search until re-indexed. Lets callers say why, not just
+        that nothing was found.
+        """
+        from app.services.embedding_service import embedding_service
+
+        active = embedding_service.active_model
+        names = set()
+        for chunk, doc_name in self._all_rows(db, doc_ids):
+            if (chunk.chunk_metadata or {}).get("embed_model", active) != active:
+                names.add(doc_name)
+        return sorted(names)
+
     def delete_by_document(self, db: Session, document_id: str) -> int:
         """Drop every chunk for a document so re-indexing replaces instead of duplicating."""
         deleted = db.query(DocumentChunk).filter(
@@ -59,6 +74,14 @@ class SQLiteVectorRepository(VectorStoreRepository):
         ).delete(synchronize_session=False)
         db.commit()
         return deleted
+
+    def _all_rows(self, db: Session, doc_ids: Optional[List[str]] = None):
+        query = db.query(DocumentChunk, Document.filename).join(
+            Document, DocumentChunk.document_id == Document.id
+        )
+        if doc_ids:
+            query = query.filter(DocumentChunk.document_id.in_(doc_ids))
+        return query.all()
 
     def _load_chunks(self, db: Session, doc_ids: Optional[List[str]] = None):
         """
@@ -68,13 +91,7 @@ class SQLiteVectorRepository(VectorStoreRepository):
         """
         from app.services.embedding_service import embedding_service
 
-        query = db.query(DocumentChunk, Document.filename).join(
-            Document, DocumentChunk.document_id == Document.id
-        )
-        if doc_ids:
-            query = query.filter(DocumentChunk.document_id.in_(doc_ids))
-        rows = query.all()
-
+        rows = self._all_rows(db, doc_ids)
         active = embedding_service.active_model
         usable, stale = [], set()
         for chunk, doc_name in rows:

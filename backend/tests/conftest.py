@@ -47,3 +47,17 @@ app.dependency_overrides[get_db] = override_get_db
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def local_embeddings():
+    """
+    Keep the suite off the network. Without this, tests embed through the real
+    Gemini key in .env and a rate limit turns into a spurious failure.
+    """
+    from app.services.embedding_service import embedding_service, LOCAL_MODEL_ID
+
+    embedding_service._initialized = True
+    embedding_service._genai_client = None
+    embedding_service.active_model = LOCAL_MODEL_ID
+    yield
